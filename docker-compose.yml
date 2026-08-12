@@ -1,0 +1,174 @@
+services:
+  playground-db:
+    image: postgres:16
+    ports:
+      - "54316:5432"
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "psql", "-U", "postgres"]
+      interval: 5s
+      timeout: 1s
+      retries: 3
+
+  playground-dbs-filler:
+    build:
+      context: docker/filldb
+    environment:
+      PGPASSWORD: "example"
+      TMP_DIR: "/tmp/schema"
+      ORIGINAL_DB_NAME: "original"
+      TRANSFORMED_DB_NAME: "transformed"
+      DBHOST: "playground-db"
+      DBUSER: "postgres"
+      DBPASSWORD: "example"
+    depends_on:
+      playground-db:
+        condition: service_healthy
+
+  mapping-store:
+    image: redis:7-alpine
+    ports:
+      - "63790:6379"
+
+  detector:
+    build:
+      context: .
+      dockerfile: docker/detector/Dockerfile
+    environment:
+      DBHOST: "playground-db"
+      DBUSER: "postgres"
+      DBPASSWORD: "example"
+      ORIGINAL_DB_NAME: "original"
+    volumes:
+      - detector-out:/out
+    depends_on:
+      playground-dbs-filler:
+        condition: service_completed_successfully
+
+  generator:
+    build:
+      context: .
+      dockerfile: docker/generator/Dockerfile
+    environment:
+      DBHOST: "playground-db"
+      DBUSER: "postgres"
+      DBPASSWORD: "example"
+      ORIGINAL_DB_NAME: "original"
+      MAPPING_STORE_URL: "redis://mapping-store:6379/0"
+      MAPPING_SALT: "${MAPPING_SALT:-dev-only-change-me}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
+    volumes:
+      - detector-out:/out
+    depends_on:
+      detector:
+        condition: service_completed_successfully
+      mapping-store:
+        condition: service_started
+
+  greenmask:
+    build:
+      context: .
+      dockerfile: docker/greenmask/Dockerfile
+    volumes:
+      - ./greenmask:/var/lib/greenmask/config
+      - greenmask-storage:/var/lib/greenmask/storage
+      - detector-out:/out
+    environment:
+      MAPPING_STORE_URL: "redis://mapping-store:6379/0"
+      MAPPING_SALT: "${MAPPING_SALT:-dev-only-change-me}"
+      DBHOST: "playground-db"
+      DBUSER: "postgres"
+      DBPASSWORD: "example"
+      ORIGINAL_DB_NAME: "original"
+    depends_on:
+      playground-dbs-filler:
+        condition: service_completed_successfully
+      generator:
+        condition: service_completed_successfully
+      mapping-store:
+        condition: service_started
+    # entrypoint = docker/greenmask/entrypoint.sh: merges config.template.yml + /out/transformation.detected.yml
+    # into config.generated.yml, then execs greenmask, so
+    # "docker compose run greenmask dump --config=/var/lib/greenmask/config.generated.yml" always runs
+    # against the latest detected columns.
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      # Host port 8020, not 8000 — guts already has an unrelated service
+      # bound to 8000. 8020 is what's forwarded to VDSina over the shared
+      # tunnel (see /etc/systemd/system/vdsina-tunnel.service on guts).
+      - "8020:8000"
+    environment:
+      JOBS_DBHOST: "playground-db"
+      JOBS_DBPORT: "5432"
+      JOBS_BROKER_URL: "redis://mapping-store:6379/1"
+      JOBS_INTERNAL_SECRET: "${JOBS_INTERNAL_SECRET:?set a real secret in .env}"
+    depends_on:
+      playground-db:
+        condition: service_healthy
+      mapping-store:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    # --concurrency bounds how many jobs run truly in parallel — without it
+    # Celery defaults to one worker process per CPU core (32 on guts),
+    # which for external DSN sources means up to 32 simultaneous full
+    # database dumps competing for the same outbound network link. Jobs
+    # beyond the limit sit in Redis (Celery's broker) with status "queued"
+    # and start automatically as soon as a slot frees — this *is* the queue,
+    # no separate queueing system needed. Tune via WORKER_CONCURRENCY in
+    # .env if guts' resources or typical source sizes change.
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=${WORKER_CONCURRENCY:-5}
+    environment:
+      JOBS_DBHOST: "playground-db"
+      JOBS_DBPORT: "5432"
+      JOBS_BROKER_URL: "redis://mapping-store:6379/1"
+      JOBS_INTERNAL_SECRET: "${JOBS_INTERNAL_SECRET:?set a real secret in .env}"
+      # Must equal this repo's absolute path *on the host* — the worker
+      # shells out to `docker compose` over the mounted host socket, so
+      # bind-mount paths in that sub-invocation only resolve correctly if
+      # this container sees the repo at the same path the host daemon does.
+      # See api/README.md "Docker deploy".
+      PIPELINE_HOST_DIR: "${PIPELINE_HOST_DIR:?set to this repo's absolute host path, e.g. /root/db-sanitization}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PIPELINE_HOST_DIR:?set to this repo's absolute host path}:${PIPELINE_HOST_DIR:?set to this repo's absolute host path}
+    working_dir: ${PIPELINE_HOST_DIR:?set to this repo's absolute host path}/api
+    depends_on:
+      playground-db:
+        condition: service_healthy
+      mapping-store:
+        condition: service_started
+
+  beat:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    # Only *enqueues* the scheduled cleanup_target_databases task on
+    # celery_app.conf.beat_schedule's interval (api/app/tasks.py) — the
+    # `worker` service is what actually executes it, so beat doesn't need
+    # the docker socket / PIPELINE_HOST_DIR mounts worker needs.
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    environment:
+      JOBS_DBHOST: "playground-db"
+      JOBS_DBPORT: "5432"
+      JOBS_BROKER_URL: "redis://mapping-store:6379/1"
+    depends_on:
+      mapping-store:
+        condition: service_started
+
+volumes:
+  pg-data:
+  greenmask-storage:
+  detector-out:
